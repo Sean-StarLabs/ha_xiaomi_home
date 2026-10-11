@@ -119,6 +119,8 @@ except ImportError:
 
 _LOGGER = logging.getLogger(__name__)
 
+POST_COMMAND_REFRESH_DELAY = 2
+
 
 def ha_entity_domain(entity: Entity) -> str:
     """Return the Home Assistant platform domain of an entity.
@@ -1284,6 +1286,8 @@ class MIoTPropertyEntity(Entity):
     _value_sub_id: int
 
     _pending_write_ha_state_timer: Optional[asyncio.TimerHandle]
+    _post_write_refresh_timer: Optional[asyncio.TimerHandle]
+    _post_write_refresh_task: Optional[asyncio.Task]
 
     def __init__(self, miot_device: MIoTDevice, spec: MIoTSpecProperty) -> None:
         if miot_device is None or spec is None or spec.service is None:
@@ -1298,6 +1302,8 @@ class MIoTPropertyEntity(Entity):
         self._state_sub_id = 0
         self._value_sub_id = 0
         self._pending_write_ha_state_timer = None
+        self._post_write_refresh_timer = None
+        self._post_write_refresh_task = None
         # Gen entity_id
         # The unique_id keeps the integration domain, see MIoTServiceEntity
         self._attr_unique_id = self.miot_device.gen_prop_entity_id(
@@ -1341,6 +1347,14 @@ class MIoTPropertyEntity(Entity):
         if self._pending_write_ha_state_timer:
             self._pending_write_ha_state_timer.cancel()
             self._pending_write_ha_state_timer = None
+        if self._post_write_refresh_timer:
+            self._post_write_refresh_timer.cancel()
+            self._post_write_refresh_timer = None
+        if self._post_write_refresh_task:
+            task = self._post_write_refresh_task
+            self._post_write_refresh_task = None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         self.miot_device.unsub_device_state(
             key=f'{ self.service.iid}.{self.spec.iid}',
             sub_id=self._state_sub_id)
@@ -1374,7 +1388,31 @@ class MIoTPropertyEntity(Entity):
                 f'{e}, {self.entity_id}, {self.name}') from e
         self._value = value
         self.async_write_ha_state()
+        if self.spec.readable:
+            if self._post_write_refresh_timer:
+                self._post_write_refresh_timer.cancel()
+            if self._post_write_refresh_task:
+                task = self._post_write_refresh_task
+                self._post_write_refresh_task = None
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self._post_write_refresh_timer = self._main_loop.call_later(
+                POST_COMMAND_REFRESH_DELAY, self.__refresh_after_write)
         return True
+
+    def __refresh_after_write(self) -> None:
+        self._post_write_refresh_timer = None
+        self._post_write_refresh_task = self._main_loop.create_task(
+            self.__refresh_after_write_async())
+
+    async def __refresh_after_write_async(self) -> None:
+        try:
+            await self.miot_device.miot_client.refresh_prop_local_async(
+                did=self.miot_device.did,
+                siid=self.spec.service.iid,
+                piid=self.spec.iid)
+        finally:
+            self._post_write_refresh_task = None
 
     async def get_property_async(self) -> Any:
         if not self.spec.readable:
@@ -1550,6 +1588,8 @@ class MIoTActionEntity(Entity):
     _in_map: dict[int, MIoTSpecProperty]
     _out_map: dict[int, MIoTSpecProperty]
     _state_sub_id: int
+    _post_action_refresh_timer: Optional[asyncio.TimerHandle]
+    _post_action_refresh_task: Optional[asyncio.Task]
 
     def __init__(self, miot_device: MIoTDevice, spec: MIoTSpecAction) -> None:
         if miot_device is None or spec is None or spec.service is None:
@@ -1559,6 +1599,8 @@ class MIoTActionEntity(Entity):
         self.service = spec.service
         self._main_loop = miot_device.miot_client.main_loop
         self._state_sub_id = 0
+        self._post_action_refresh_timer = None
+        self._post_action_refresh_task = None
         # Gen entity_id
         # The unique_id keeps the integration domain, see MIoTServiceEntity
         self._attr_unique_id = self.miot_device.gen_action_entity_id(
@@ -1591,6 +1633,14 @@ class MIoTActionEntity(Entity):
             handler=self.__on_device_state_changed)
 
     async def async_will_remove_from_hass(self) -> None:
+        if self._post_action_refresh_timer:
+            self._post_action_refresh_timer.cancel()
+            self._post_action_refresh_timer = None
+        if self._post_action_refresh_task:
+            task = self._post_action_refresh_task
+            self._post_action_refresh_task = None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         self.miot_device.unsub_device_state(
             key=f'a.{ self.service.iid}.{self.spec.iid}',
             sub_id=self._state_sub_id)
@@ -1599,13 +1649,40 @@ class MIoTActionEntity(Entity):
         self, in_list: Optional[list] = None
     ) -> Optional[list]:
         try:
-            return await self.miot_device.miot_client.action_async(
+            result = await self.miot_device.miot_client.action_async(
                 did=self.miot_device.did,
                 siid=self.service.iid,
                 aiid=self.spec.iid,
                 in_list=in_list or [])
         except MIoTClientError as e:
             raise RuntimeError(f'{e}, {self.entity_id}, {self.name}') from e
+        if self._post_action_refresh_timer:
+            self._post_action_refresh_timer.cancel()
+        if self._post_action_refresh_task:
+            task = self._post_action_refresh_task
+            self._post_action_refresh_task = None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._post_action_refresh_timer = self._main_loop.call_later(
+            POST_COMMAND_REFRESH_DELAY, self.__refresh_after_action)
+        return result
+
+    def __refresh_after_action(self) -> None:
+        self._post_action_refresh_timer = None
+        self._post_action_refresh_task = self._main_loop.create_task(
+            self.__refresh_after_action_async())
+
+    async def __refresh_after_action_async(self) -> None:
+        try:
+            for prop in self.service.properties:
+                if not prop.readable:
+                    continue
+                await self.miot_device.miot_client.refresh_prop_local_async(
+                    did=self.miot_device.did,
+                    siid=prop.service.iid,
+                    piid=prop.iid)
+        finally:
+            self._post_action_refresh_task = None
 
     def __on_device_state_changed(
         self, key: str, state: MIoTDeviceState

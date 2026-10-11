@@ -1632,7 +1632,11 @@ class MipsLocalClient(_MipsClient):
         def on_msg_reply(payload: str, ctx: Any):
             fut: asyncio.Future = ctx
             if fut:
-                self.main_loop.call_soon_threadsafe(fut.set_result, payload)
+                def set_result() -> None:
+                    if not fut.done():
+                        fut.set_result(payload)
+
+                self.main_loop.call_soon_threadsafe(set_result)
         if not self.__request_external(
                 topic=topic,
                 payload=payload,
@@ -1640,7 +1644,8 @@ class MipsLocalClient(_MipsClient):
                 on_reply_ctx=fut_handler,
                 timeout_ms=timeout_ms):
             # Request error
-            fut_handler.set_result('internal request error')
+            if not fut_handler.done():
+                fut_handler.set_result('internal request error')
 
         result = await fut_handler
         try:

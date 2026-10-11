@@ -900,8 +900,11 @@ class MIoTLan:
         self, did: str, msg: dict, timeout_ms: int = 10000
     ) -> dict:
         def call_api_handler(msg: dict, fut: asyncio.Future):
-            self._main_loop.call_soon_threadsafe(
-                fut.set_result, msg)
+            def set_result() -> None:
+                if not fut.done():
+                    fut.set_result(msg)
+
+            self._main_loop.call_soon_threadsafe(set_result)
 
         fut: asyncio.Future = self._main_loop.create_future()
         self._internal_loop.call_soon_threadsafe(

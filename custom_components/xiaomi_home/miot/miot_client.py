@@ -46,7 +46,8 @@ off Xiaomi or its affiliates' products.
 MIoT client instance.
 """
 from copy import deepcopy
-from typing import Any, Callable, Optional, final
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, final
 import asyncio
 import json
 import logging
@@ -169,6 +170,10 @@ class MIoTClient:
     _refresh_props_list: dict[str, dict]
     _refresh_props_timer: Optional[asyncio.TimerHandle]
     _refresh_props_retry_count: int
+    _local_prop_read_locks: dict[str, asyncio.Lock]
+    _local_prop_read_times: dict[str, float]
+    _device_operation_locks: dict[str, asyncio.Lock]
+    _device_operation_owners: dict[str, set[asyncio.Task]]
 
     # Persistence notify handler, params: notify_id, title, message
     _persistence_notify: Callable[[str, Optional[str], Optional[str]], None]
@@ -242,6 +247,10 @@ class MIoTClient:
         self._refresh_props_list = {}
         self._refresh_props_timer = None
         self._refresh_props_retry_count = 0
+        self._local_prop_read_locks = {}
+        self._local_prop_read_times = {}
+        self._device_operation_locks = {}
+        self._device_operation_owners = {}
 
         self._persistence_notify = None
         self._show_devices_changed_notify_timer = None
@@ -640,7 +649,45 @@ class MIoTClient:
                 error, traceback.format_exc())
         return False
 
+    @asynccontextmanager
+    async def device_operation(self, did: str) -> AsyncIterator[None]:
+        """Prevent commands for a device from overlapping."""
+        task = asyncio.current_task()
+        if task is None:
+            raise MIoTClientError('device operation has no current task')
+        if task in self._device_operation_owners.get(did, set()):
+            yield
+            return
+
+        lock = self._device_operation_locks.setdefault(did, asyncio.Lock())
+        async with lock:
+            owners = {task}
+            self._device_operation_owners[did] = owners
+            try:
+                yield
+            finally:
+                if self._device_operation_owners.get(did) is owners:
+                    self._device_operation_owners.pop(did)
+
+    def authorize_device_operation_task(
+        self, did: str, task: asyncio.Task
+    ) -> None:
+        """Allow a child task to finish the current device operation."""
+        current = asyncio.current_task()
+        owners = self._device_operation_owners.get(did)
+        if current is None or owners is None or current not in owners:
+            raise MIoTClientError('no device operation to share')
+        owners.add(task)
+        task.add_done_callback(owners.discard)
+
     async def set_prop_async(
+        self, did: str, siid: int, piid: int, value: Any
+    ) -> bool:
+        async with self.device_operation(did):
+            return await self.__set_prop_async(
+                did=did, siid=siid, piid=piid, value=value)
+
+    async def __set_prop_async(
         self, did: str, siid: int, piid: int, value: Any
     ) -> bool:
         if did not in self._device_list_cache:
@@ -742,14 +789,27 @@ class MIoTClient:
             if self._network.network_status:
                 result = await self._http.get_prop_async(
                     did=did, siid=siid, piid=piid)
-                if result:
+                if result is not None:
                     return result
         except Exception as err:  # pylint: disable=broad-exception-caught
             # Catch all exceptions
             _LOGGER.error(
                 'client get prop from cloud error, %s, %s',
                 err, traceback.format_exc())
+        return await self.__get_prop_from_local_async(
+            did=did, siid=siid, piid=piid)
+
+    async def __get_prop_from_local_async(
+        self, did: str, siid: int, piid: int,
+        safe: bool = False, timeout_ms: int = 10000
+    ) -> Any:
         if self._ctrl_mode == CtrlMode.AUTO:
+            if safe:
+                return await self.__throttled_local_prop_read(
+                    did,
+                    lambda: self.__get_prop_from_local_async(
+                        did=did, siid=siid, piid=piid,
+                        timeout_ms=timeout_ms))
             # Central hub gateway
             device_gw = self._device_list_gateway.get(did, None)
             if (
@@ -762,17 +822,72 @@ class MIoTClient:
                     _LOGGER.error('no gw route, %s', device_gw)
                 else:
                     return await mips.get_prop_async(
-                        did=did, siid=siid, piid=piid)
+                        did=did, siid=siid, piid=piid,
+                        timeout_ms=timeout_ms)
             # Lan
             device_lan = self._device_list_lan.get(did, None)
             if device_lan and device_lan.get('online', False):
                 return await self._miot_lan.get_prop_async(
-                    did=did, siid=siid, piid=piid)
+                    did=did, siid=siid, piid=piid,
+                    timeout_ms=timeout_ms)
         # _LOGGER.error(
         #     'client get prop failed, no-link, %s.%d.%d', did, siid, piid)
         return None
 
+    async def __throttled_local_prop_read(
+        self, did: str, reader: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        lock = self._local_prop_read_locks.setdefault(did, asyncio.Lock())
+        async with lock:
+            delay = (
+                self._local_prop_read_times.get(did, 0)
+                + REFRESH_PROPS_DELAY
+                - self._main_loop.time()
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                return await reader()
+            finally:
+                self._local_prop_read_times[did] = self._main_loop.time()
+
+    async def get_prop_local_async(
+        self, did: str, siid: int, piid: int, timeout_ms: int = 6000
+    ) -> Optional[dict]:
+        """Get a property directly from a local device route."""
+        if did not in self._device_list_cache:
+            raise MIoTClientError(f'did not exist, {did}')
+
+        value = await self.__get_prop_from_local_async(
+            did=did, siid=siid, piid=piid,
+            safe=True, timeout_ms=timeout_ms)
+        if value is None:
+            return None
+        return {
+            'did': did,
+            'siid': siid,
+            'piid': piid,
+            'value': value,
+        }
+
+    async def refresh_prop_local_async(
+        self, did: str, siid: int, piid: int, timeout_ms: int = 6000
+    ) -> Optional[dict]:
+        """Read a property locally and publish the confirmed value."""
+        result = await self.get_prop_local_async(
+            did=did, siid=siid, piid=piid, timeout_ms=timeout_ms)
+        if result is not None:
+            self.__on_prop_msg(params=result, ctx=None)
+        return result
+
     async def action_async(
+        self, did: str, siid: int, aiid: int, in_list: list
+    ) -> list:
+        async with self.device_operation(did):
+            return await self.__action_async(
+                did=did, siid=siid, aiid=aiid, in_list=in_list)
+
+    async def __action_async(
         self, did: str, siid: int, aiid: int, in_list: list
     ) -> list:
         if did not in self._device_list_cache:
@@ -1682,7 +1797,8 @@ class MIoTClient:
                 request_list.pop(
                     f'{result["did"]}|{result["siid"]}|{result["piid"]}',
                     None)
-                self.__on_prop_msg(params=result, ctx=None)
+                self.__on_prop_msg(
+                    params={**result, '_from_cloud_cache': True}, ctx=None)
             if request_list:
                 _LOGGER.info(
                     'refresh props failed, cloud, %s',
@@ -1720,9 +1836,13 @@ class MIoTClient:
                 continue
             request_list[did] = {
                 **params,
-                'fut': mips_gw.get_prop_async(
-                    did=did, siid=params['siid'], piid=params['piid'],
-                    timeout_ms=6000)}
+                'fut': self.__throttled_local_prop_read(
+                    did,
+                    lambda did=did, params=params, mips_gw=mips_gw:
+                        mips_gw.get_prop_async(
+                            did=did,
+                            siid=params['siid'], piid=params['piid'],
+                            timeout_ms=6000))}
         results = await asyncio.gather(
             *[v['fut'] for v in request_list.values()])
         for (did, param), result in zip(request_list.items(), results):
@@ -1763,9 +1883,13 @@ class MIoTClient:
                 continue
             request_list[did] = {
                 **params,
-                'fut': self._miot_lan.get_prop_async(
-                    did=did, siid=params['siid'], piid=params['piid'],
-                    timeout_ms=6000)}
+                'fut': self.__throttled_local_prop_read(
+                    did,
+                    lambda did=did, params=params:
+                        self._miot_lan.get_prop_async(
+                            did=did,
+                            siid=params['siid'], piid=params['piid'],
+                            timeout_ms=6000))}
         results = await asyncio.gather(
             *[v['fut'] for v in request_list.values()])
         for (did, param), result in zip(request_list.items(), results):
