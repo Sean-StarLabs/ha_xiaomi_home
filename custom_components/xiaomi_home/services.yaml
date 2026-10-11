@@ -1,0 +1,17 @@
+start_washer:
+  name: Start washer
+  description: >-
+    Applies the washer settings shown in Home Assistant, verifies the values
+    reported by Xiaomi, and starts only when every applicable setting matches.
+  target:
+    device:
+      integration: xiaomi_home
+  fields:
+    delay_until_entity_id:
+      name: Delay until
+      description: >-
+        Optional input_datetime entity used to calculate the reservation delay.
+      required: false
+      selector:
+        entity:
+          domain: input_datetime

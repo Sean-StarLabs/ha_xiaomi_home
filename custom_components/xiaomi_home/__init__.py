@@ -64,6 +64,9 @@ from .miot.const import (
 from .miot.miot_error import MIoTOauthError
 from .miot.miot_device import MIoTDevice
 from .miot.miot_client import MIoTClient, get_miot_instance_async
+from .washer import (
+    async_prepare_washer_unload, async_register_washer_service,
+    washer_entry_ready)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +84,7 @@ async def async_setup(hass: HomeAssistant, hass_config: dict) -> bool:
     hass.data[DOMAIN].setdefault('entities', {})
     for platform in SUPPORTED_PLATFORMS:
         hass.data[DOMAIN]['entities'][platform] = []
+    await async_register_washer_service(hass)
     return True
 
 
@@ -337,6 +341,7 @@ async def async_setup_entry(
 
         await spec_parser.deinit_async()
         await manufacturer.deinit_async()
+        washer_entry_ready(entry_id)
 
     except MIoTOauthError as oauth_error:
         ha_persistent_notify(
@@ -355,6 +360,7 @@ async def async_unload_entry(
 ) -> bool:
     """Unload the entry."""
     entry_id = config_entry.entry_id
+    await async_prepare_washer_unload(entry_id)
     # Unload the platform
     unload_ok = await hass.config_entries.async_unload_platforms(
         config_entry, SUPPORTED_PLATFORMS)
